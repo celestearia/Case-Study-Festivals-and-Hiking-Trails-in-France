@@ -1,0 +1,593 @@
+---
+title: "Case Study: Festivals and Hiking Trails in France"
+author: "John Paul CELESTE"
+date: "11 June 2024"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: sandstone
+    highlight: espresso
+    css: styles.css
+runtime: shiny
+---
+# Introduction
+
+This case study explores the potential benefits of promoting hiking trails that are in close proximity to festivals in various regions of France. By analyzing the relationship between the locations of festivals and trails, we aim to provide insights that can help boost local tourism and business opportunities.
+
+<!--- This part loads the required libraries as well as read the datasets --->
+
+```{r map_setup, include=FALSE, eval=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Set CRAN repository mirror
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+# Function to check and install missing packages
+check_and_install <- function(packages) {
+  for (package in packages) {
+    if (!require(package, character.only = TRUE)) {
+      install.packages(package, dependencies = TRUE)
+      library(package, character.only = TRUE)
+    }
+  }
+}
+
+# List of required packages
+required_packages <- c("shiny", "leaflet", "dplyr", "geosphere", "purrr", "tidyr", "RColorBrewer")
+
+# Check and install missing packages
+check_and_install(required_packages)
+
+# Load necessary libraries
+required_libraries <- c("shiny", "leaflet", "dplyr", "geosphere", "purrr", "tidyr", "RColorBrewer")
+lapply(required_libraries, library, character.only = TRUE)
+
+# Read the dataset files
+festivals <- read.csv("cleaned_festivals.csv")
+trails <- read.csv("cleaned_trails.csv")
+```
+
+<!--- This part processes all the datasets and allows them to be used on the web application -->
+```{r data_processing, echo=FALSE, error=TRUE, message=TRUE, eval=TRUE}
+# Filter out rows without location data
+festivals <- festivals %>% filter(!is.na(Longitude) & !is.na(Latitude))
+trails <- trails %>% filter(!is.na(Longitude) & !is.na(Latitude))
+
+# Custom date conversion (Due to French names)
+convert_to_month <- function(date_str) {
+  months <- c("janvier" = 1, "février" = 2, "mars" = 3, "avril" = 4,
+              "mai" = 5, "juin" = 6, "juillet" = 7, "août" = 8,
+              "septembre" = 9, "octobre" = 10, "novembre" = 11, "décembre" = 12)
+  months[tolower(date_str)]
+}
+
+# Convert Debut and Fin columns to numeric months using custom function
+festivals$Debut <- sapply(festivals$Debut, convert_to_month)
+festivals$Fin <- sapply(festivals$Fin, convert_to_month)
+
+# Function to create popup information for festivals
+create_popup_info <- function(festival) {
+  website <- ifelse(grepl("\\.[a-z]{2,}$", festival$Site_internet_du_festival), 
+                    festival$Site_internet_du_festival, 
+                    paste0("https://www.google.com/search?q=", URLencode(festival$Nom_du_festival)))
+  
+  paste0("<strong>Festival: </strong>", festival$Nom_du_festival, "<br>",
+         "<strong>Period: </strong>", festival$Debut, " - ", festival$Fin, "<br>",
+         "<strong>Type: </strong>", festival$Discipline_dominante, "<br>",
+         "<strong>Commune: </strong>", festival$Commune_principale_de_deroulement, "<br>",
+         "<strong>Region: </strong>", festival$Region_principale_de_deroulement, "<br>",
+         "<strong>Year Established: </strong>", festival$Annee_de_creation_du_festival, "<br>",
+         "<strong>Website: </strong><a href='", website, "' target='_blank'>", website, "</a>")
+}
+
+# Function to create popup information for trails
+create_trail_popup_info <- function(trail) {
+  location <- paste0(trail$Latitude, ",", trail$Longitude)
+  google_maps_link <- paste0("https://www.google.com/maps/search/?api=1&query=", URLencode(location))
+  
+  paste0("<strong>Trail: </strong>", trail$Nom_du_POI, "<br>",
+         "<strong>Commune: </strong>", trail$commune, "<br>",
+         "<strong>Location: </strong>", trail$Latitude, ", ", trail$Longitude, "<br>",
+         "<strong>Address: </strong>", trail$Adresse_postale, "<br>",
+         "<strong>Description: </strong>", trail$Description, "<br>",
+         "<strong>Google Maps: </strong><a href='", google_maps_link, "' target='_blank'>", google_maps_link, "</a>")
+}
+
+# Calculate distances from trails to the nearest festival
+trail_distances <- trails %>%
+  rowwise() %>%
+  mutate(distance_to_festival = min(distHaversine(c(Longitude, Latitude), festivals %>% select(Longitude, Latitude))))
+
+trails <- trails %>%
+  mutate(distance_to_festival = trail_distances$distance_to_festival)
+```
+
+<!--- This part defines the general layout of the web application --->
+```{r map_ui, echo=FALSE, error=TRUE, eval=TRUE}
+# UI definition
+ui <- fluidPage(
+  tags$head(
+    tags$style(HTML("
+      #map {
+        height: calc(100vh - 80px) !important;
+      }
+    "))
+  ),
+  titlePanel("Interactive Map of Festivals and Trails in France"),
+  sidebarLayout(
+    sidebarPanel(
+      selectInput("region", "Select Region", choices = sort(unique(festivals$Region_principale_de_deroulement)), selected = "Grand Est"),
+      selectInput("commune", "Select Commune", choices = NULL),
+      uiOutput("festival_selector")
+    ),
+    mainPanel(
+      leafletOutput("map", width = "100%", height = "100%")
+    )
+  )
+)
+```
+
+<!--- This part handles the logic of the web application --->
+```{r map_logic, echo=FALSE, error=TRUE, message=TRUE, eval=TRUE}
+# Define server logic
+server <- function(input, output, session) {
+  output$map <- renderLeaflet({
+    # Create the base map
+    leaflet() %>%
+      addTiles() %>%
+      setView(lat = 46.603354, lng = 1.888334, zoom = 6)  # Centered on France
+  })
+  
+  # Observe changes in region selection and update communes accordingly
+  observe({
+    selected_region <- input$region
+    communes <- sort(unique(festivals$Commune_principale_de_deroulement[festivals$Region_principale_de_deroulement == selected_region]))
+    updateSelectInput(session, "commune", choices = communes, selected = communes[1])
+  })
+  
+  # Update the festival selector based on the selected commune
+  observe({
+    selected_region <- input$region
+    selected_commune <- input$commune
+    
+    filtered_festivals <- festivals %>%
+      filter(Region_principale_de_deroulement == selected_region,
+             Commune_principale_de_deroulement == selected_commune)
+    
+    updateSelectInput(session, "festival", "Select Festival", 
+                      choices = filtered_festivals$Nom_du_festival, selected = filtered_festivals$Nom_du_festival[1])
+  })
+  
+  output$festival_selector <- renderUI({
+    selectInput("festival", "Select Festival", choices = NULL)
+  })
+  
+  observeEvent(input$festival, {
+    selected_region <- input$region
+    selected_commune <- input$commune
+    selected_festival <- input$festival
+    
+    filtered_festivals <- festivals %>%
+      filter(Region_principale_de_deroulement == selected_region,
+             Commune_principale_de_deroulement == selected_commune,
+             Nom_du_festival == selected_festival)
+    
+    festival_coords <- filtered_festivals %>% select(Longitude, Latitude)
+    
+    if (nrow(festival_coords) > 0) {
+      filtered_trails <- trails %>%
+        rowwise() %>%
+        mutate(distance_to_festival = min(distHaversine(c(Longitude, Latitude), festival_coords))) %>%
+        filter(distance_to_festival <= 10000)
+    } else {
+      filtered_trails <- trails[FALSE,]
+    }
+
+    # Assign colors to festivals
+    num_festivals <- nrow(filtered_festivals)
+    if (num_festivals < 3) {
+      num_festivals <- 3  # Ensure at least 3 colors
+    }
+    festival_colors <- colorFactor(brewer.pal(num_festivals, "Set1"), filtered_festivals$Nom_du_festival)
+
+    # Create a color palette for trails based on distance
+    trail_color_pal <- colorNumeric(palette = "Dark2", domain = filtered_trails$distance_to_festival)
+    
+    # Center map on the selected festival if there are festivals or trails
+    if (nrow(filtered_festivals) > 0) {
+      center_lat <- mean(filtered_festivals$Latitude, na.rm = TRUE)
+      center_lng <- mean(filtered_festivals$Longitude, na.rm = TRUE)
+    } else if (nrow(filtered_trails) > 0) {
+      center_lat <- mean(filtered_trails$Latitude, na.rm = TRUE)
+      center_lng <- mean(filtered_trails$Longitude, na.rm = TRUE)
+    } else {
+      center_lat <- 46.603354
+      center_lng <- 1.888334
+    }
+    
+    leafletProxy("map") %>%
+      clearMarkers() %>%
+      setView(lat = center_lat, lng = center_lng, zoom = 10) %>%
+      addCircleMarkers(
+        data = filtered_festivals,
+        lat = ~Latitude,
+        lng = ~Longitude,
+        popup = ~sapply(1:nrow(filtered_festivals), function(i) {
+          popup_info <- create_popup_info(filtered_festivals[i,])
+          if (nrow(filtered_trails) == 0) {
+            popup_info <- paste0(popup_info, "<br><strong>Note: </strong>No trails found nearby.")
+          }
+          popup_info
+        }),
+        color = ~festival_colors(Nom_du_festival),
+        radius = 15
+      ) %>%
+      addCircleMarkers(
+        data = filtered_trails,
+        lat = ~Latitude,
+        lng = ~Longitude,
+        popup = ~sapply(1:nrow(filtered_trails), function(i) create_trail_popup_info(filtered_trails[i,])),
+        color = ~trail_color_pal(distance_to_festival),
+        fillOpacity = 0.8,  # Adjust opacity for better visibility
+        radius = 7
+      )
+  })
+} 
+```
+
+<!--- This part launches the web app --->
+```{r launch_map, echo=FALSE, error=TRUE, eval=TRUE}
+# Run the application 
+shinyApp(ui = ui, server = server)
+```
+
+# Business Task
+
+The primary business task is to identify and visualize festivals occurring in different periods of the year and highlight nearby hiking trails. This information will help tourism boards and travel agencies create promotional campaigns to attract tourists interested in both cultural events and outdoor activities.
+
+# Data Sources
+
+* All the raw data files are sourced from the French Government's public data repository (https://www.data.gouv.fr/) 
+
+### Festivals Dataset
+* **Festivals Data:** This dataset contains information about various festivals in France. The raw data file is festivals-global-festivals-_-pl.csv, and the cleaned data is cleaned_festivals_with_website.csv.
+
+- **Total Entries:** 5465
+- **Columns:**
+  - `Nom_du_festival`: Name of the festival
+  - `Code_postal_(de_la_commune_principale_de_deroulement)`: Postal code
+  - `Commune_principale_de_deroulement`: Main commune where the festival is held
+  - `Region_principale_de_deroulement`: Main region where the festival is held
+  - `Annee_de_creation_du_festival`: Year of festival creation
+  - `Discipline_dominante`: Dominant discipline of the festival
+  - `Site_internet_du_festival`: Festival website
+  - `Latitude`: Latitude of the festival location
+  - `Longitude`: Longitude of the festival location
+  - `Debut`: Start date of the festival
+  - `Fin`: End date of the festival
+
+### Trails Dataset  
+* **Hiking Trails Data:** This dataset includes details about hiking trails in France. The raw data file is datatourisme-tour.csv, and the cleaned data is cleaned_datatourisme.csv.
+
+- **Total Entries:** 22121
+- **Columns:**
+  - `Nom_du_POI`: Name of the point of interest (POI)
+  - `Latitude`: Latitude of the POI
+  - `Longitude`: Longitude of the POI
+  - `Adresse_postale`: Postal address
+  - `Description`: Description of the POI
+  - `code_postal`: Postal code
+  - `commune`: Commune where the POI is located
+
+## Initial Observations
+- The festivals dataset contains information on various festivals, including their location, discipline, and dates.
+- The trails dataset contains information on various trails, including their location and descriptions.
+- Both datasets have geographic coordinates (latitude and longitude), which can be used for mapping visualizations.
+
+## Festivals Dataset Cleaning (`fete_cleaner.py`)
+
+- _See Appendix to view script_ 
+
+### Script Content and Functions
+
+1. **Import Libraries:**
+   - `pandas` for data manipulation.
+   - `unidecode` for removing accents from characters.
+
+2. **Functions:**
+   - `extract_months_from_period(period)`: Extracts start and end months from a period string.
+   - `clean_column_name(column_name)`: Cleans column names by removing accents and replacing spaces with underscores.
+   - `clean_festival_data(input_file_path, output_file_path)`: Main function to clean the dataset.
+
+### Cleaning Process
+
+1. **Read CSV File:**
+   - The script reads the input CSV file using `pandas.read_csv()`.
+
+2. **Clean Column Names:**
+   - Columns are stripped of leading/trailing whitespaces and special characters.
+   - Specific columns to keep are defined.
+
+3. **Filter and Clean Data:**
+   - Keeps only necessary columns, removes duplicates, and drops rows with missing values.
+   - Renames columns by removing accents and replacing spaces with underscores.
+   - Standardizes the `Nom_du_festival` column to title case.
+   - Splits the `Geocodage_xy` column into `Latitude` and `Longitude` and converts them to float.
+
+4. **Extract and Clean Dates:**
+   - Extracts start and end months from the `Periode_principale_de_deroulement_du_festival` column.
+   - Adds `Debut` and `Fin` columns to the dataframe.
+
+5. **Save Cleaned Data:**
+   - Saves the cleaned dataframe to a new CSV file.
+
+
+## Trails Dataset Cleaning (`trails_cleaner.py`)
+- _See Appendix to view script_ 
+
+### Script Content and Functions
+
+1. **Import Libraries:**
+   - `pandas` for data manipulation.
+   - `unicodedata` for removing accents from characters.
+
+2. **Functions:**
+   - `clean_column_name(column_name)`: Cleans column names by removing accents and replacing spaces with underscores.
+   - `clean_data(input_file_path, output_file_path)`: Main function to clean the dataset.
+
+### Cleaning Process
+
+1. **Read CSV File:**
+   - The script reads the input CSV file using `pandas.read_csv()`.
+
+2. **Clean Column Names:**
+   - Columns are stripped of leading/trailing whitespaces and special characters.
+   - Specific columns to keep are defined.
+
+3. **Filter and Clean Data:**
+   - Keeps only necessary columns, removes duplicates, and drops rows with missing `Latitude` or `Longitude`.
+   - Splits the `Code_postal_et_commune` column into `code_postal` and `commune`.
+   - Standardizes the `Nom_du_POI` column to title case.
+   - Drops the `Code_postal_et_commune` column.
+
+4. **Save Cleaned Data:**
+   - Saves the cleaned dataframe to a new CSV file.
+  
+# Analysis
+- **Region Analysis:** Identified regions with the highest density of festivals and trails.
+- **Festival and Trail Types:** Analyzed the types of festivals and trails that co-occur in close proximity.
+- **Distance Analysis:** Calculated average distances between festivals and trails in different regions.
+
+# Findings
+1. **High Density Regions:** Certain regions, such as Grand Est and Provence-Alpes-Côte d'Azur, have a high density of both festivals and trails.
+2. **Common Festival Types:** Music and cultural festivals are commonly found near popular trails, providing opportunities for joint promotions.
+3. **Proximity Benefits:** Trails within 10 km of festivals offer significant potential for boosting local tourism by attracting festival-goers to explore nearby natural attractions.
+
+# Visualisations
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, fig.width = 15, fig.height = 10)
+library(ggplot2)
+library(ggplot2)
+library(readr)
+library(dplyr)
+```
+
+```{r top_festivals, echo=FALSE, out.width='100%'}
+
+# Read the datasets
+top_20_festivals <- read_csv('top_20_festivals.csv')
+
+# Create a new column with combined festival and commune names
+top_20_festivals <- top_20_festivals %>%
+  mutate(Festival_and_Commune = paste(Nom_du_festival, "(", Commune_principale_de_deroulement, ")"))
+
+# Define custom theme for consistent styling
+custom_theme <- theme_minimal(base_size = 15) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title.x = element_text(face = "bold"),
+    axis.title.y = element_text(face = "bold"),
+    axis.text = element_text(color = "black"),
+    panel.grid.minor = element_blank()
+  )
+
+# Top 20 Festivals with the Most Trails within a 10km Radius
+ggplot(top_20_festivals, aes(x = reorder(Festival_and_Commune, Trails_nearby), y = Trails_nearby, fill = Trails_nearby)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_gradient(low = "skyblue", high = "blue") +
+  coord_flip() +
+  labs(title = 'Top 20 Festivals with the Most Trails within a 10km Radius',
+       x = 'Festival Name (Commune)',
+       y = 'Number of Trails within 10km') +
+  geom_text(aes(label = Trails_nearby), hjust = -0.2, color = "black", size = 3.5) +
+  custom_theme
+```
+
+
+```{r top_communes, echo=FALSE, out.width='100%'}
+
+# Read the datasets
+commune_trails <- read_csv('commune_trails.csv')
+
+# Top 10 Communes with Festivals with the Most Trails within a 10km Radius
+ggplot(commune_trails, aes(x = reorder(Commune_principale_de_deroulement, Trails_nearby), y = Trails_nearby, fill = Trails_nearby)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_gradient(low = "lightgreen", high = "darkgreen") +
+  coord_flip() +
+  labs(title = 'Top 10 Communes with Festivals with the Most Trails within a 10km Radius',
+       x = 'Commune',
+       y = 'Number of Trails within 10km') +
+  geom_text(aes(label = Trails_nearby), hjust = -0.2, color = "black", size = 3.5) +
+  custom_theme
+```
+The visualization highlights the top festivals and communes in France with the most hiking trails located within 10 kilometers.
+
+- **Top Festival:** The festival with the highest number of nearby trails is Poutay Jazz & blues, located in Mutzig. This suggests a significant overlap between cultural and outdoor recreational activities.
+
+- **Festival Distribution:** The distribution of trails around these festivals shows potential for promoting both cultural events and outdoor activities, catering to diverse tourist interests.
+
+**Implications:**
+
+- **Tourism Development:** Regions hosting these festivals can develop marketing strategies that highlight both the festivals and the nearby trails to attract tourists interested in both cultural and nature activities.
+- **Community Engagement:** Local communities can benefit from increased tourism by organizing more events and maintaining the trails.
+
+```{r region_festivals, echo=FALSE, out.width='100%'}
+
+# Read the datasets
+region_festivals <- read_csv('region_festivals.csv')
+
+# Rank of Regions with the Most Festivals
+ggplot(region_festivals, aes(x = reorder(Region, Number_of_Festivals), y = Number_of_Festivals, fill = Number_of_Festivals)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_gradient(low = "coral", high = "red") +
+  coord_flip() +
+  labs(title = 'Rank of Regions with the Most Festivals',
+       x = 'Region',
+       y = 'Number of Festivals') +
+  geom_text(aes(label = Number_of_Festivals), hjust = -0.2, color = "black", size = 3.5) +
+  custom_theme
+```
+
+```{r region_trails, echo=FALSE, out.width='100%'}
+# Read the datasets
+region_trails <- read_csv('region_trails.csv')
+
+# Rank of Regions with the Most Trails
+ggplot(region_trails, aes(x = reorder(Region, Number_of_Trails), y = Number_of_Trails, fill = Number_of_Trails)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_gradient(low = "violet", high = "darkviolet") +
+  coord_flip() +
+  labs(title = 'Rank of Regions with the Most Trails',
+       x = 'Region',
+       y = 'Number of Trails') +
+  geom_text(aes(label = Number_of_Trails), hjust = -0.2, color = "black", size = 3.5) +
+  custom_theme
+```
+These plots ranks regions in France by the number of hiking trails they offer.
+
+- **Leading Region:** Nouvelle-Aquitaine has the highest number of trails, making it a prime destination for hiking enthusiasts.
+Trail Distribution: The distribution across regions indicates widespread opportunities for hiking and outdoor activities throughout the country.
+Implications:
+
+- **Nature Tourism:** Regions with numerous trails can be marketed as prime destinations for nature and adventure tourism.
+Sustainable Development: Emphasis on maintaining and promoting trails can lead to sustainable tourism practices, preserving natural landscapes while benefiting local communities.
+
+
+# Business Insights
+Based on the analysis, we can provide the following insights:
+
+1. **Seasonal Promotion:** Tourism boards can promote festivals and hiking trails together to attract more tourists during different periods of the year.
+2. **Geographic Targeting:** Identify regions with a high density of festivals and hiking trails for targeted marketing campaigns.
+3. **Event Coordination:** Encourage local businesses to coordinate events with festivals to enhance the tourist experience and boost local economies.
+
+# Conclusion
+
+This case study demonstrates the process of cleaning and analyzing data to provide actionable business insights. By leveraging the relationship between cultural events and outdoor activities, tourism boards can create more appealing and effective promotional campaigns.
+
+Additionally, there are common locations that host both festivals and trails, suggesting potential areas of interest for tourists and local communities. These insights can help in planning tourism activities, enhancing local economies, and promoting cultural and natural heritage.
+
+# Next Steps
+- **Visitor Analysis:** Study the impact of joint promotions on visitor numbers and satisfaction.
+- **Economic Impact:** Analyze the economic benefits for local businesses from increased tourism.
+- **Feedback Mechanism:** Implement a feedback system for tourists to gather insights on their experiences.
+
+This case study demonstrates the value of integrating geographic and event data to uncover opportunities for enhancing tourism and local economies. The interactive map serves as a powerful tool for visualizing these relationships and guiding strategic decisions.
+
+# Appendix
+
+## Python Scripts
+
+### `viz_extractor.py`
+
+```{python, eval=FALSE, echo=TRUE}
+import pandas as pd
+from geopy.distance import distance
+from scipy.spatial import cKDTree
+import numpy as np
+
+# Load the datasets
+festivals_df = pd.read_csv('cleaned_festivals.csv')
+trails_df = pd.read_csv('cleaned_trails.csv')
+
+# Filter out invalid latitude and longitude values
+festivals_df = festivals_df[(festivals_df['Latitude'] <= 90) & (festivals_df['Latitude'] >= -90) &
+                            (festivals_df['Longitude'] <= 180) & (festivals_df['Longitude'] >= -180)]
+
+trails_df = trails_df[(trails_df['Latitude'] <= 90) & (trails_df['Latitude'] >= -90) &
+                      (trails_df['Longitude'] <= 180) & (trails_df['Longitude'] >= -180)]
+
+# Create an array of the trail coordinates
+trail_coords = trails_df[['Latitude', 'Longitude']].values
+
+# Create a k-d tree for fast spatial queries
+trail_tree = cKDTree(trail_coords)
+
+# Function to count number of trails within a 10km radius of a festival using the k-d tree
+def count_trails_near_festival(festival_lat, festival_lon, tree, radius_km=10):
+    # Query the k-d tree for trails within the radius
+    count = len(tree.query_ball_point([festival_lat, festival_lon], radius_km / 111))  # convert km to degrees
+    return count
+
+# Add a column to the festivals DataFrame with the number of trails within 10km
+festivals_df['Trails_nearby'] = festivals_df.apply(
+    lambda row: count_trails_near_festival(row['Latitude'], row['Longitude'], trail_tree), axis=1
+)
+
+# Extract data needed for visualization
+
+# 1. Top 20 Festivals with the most trails within a 10km radius
+top_20_festivals = festivals_df.nlargest(20, 'Trails_nearby')[['Nom_du_festival', 'Commune_principale_de_deroulement', 'Trails_nearby']]
+
+# 2. Top 10 Communes with Festivals with the most trails within a 10km radius
+commune_trails = festivals_df.groupby('Commune_principale_de_deroulement')['Trails_nearby'].sum().nlargest(10).reset_index()
+
+# 3. Rank of Regions with the most festivals
+region_festivals = festivals_df['Region_principale_de_deroulement'].value_counts().reset_index()
+region_festivals.columns = ['Region', 'Number_of_Festivals']
+
+# 4. Rank of Regions with the most trails
+region_trails = trails_df['Region'].value_counts().reset_index()
+region_trails.columns = ['Region', 'Number_of_Trails']
+
+# Save the extracted data for visualization
+top_20_festivals.to_csv('top_20_festivals.csv', index=False)
+commune_trails.to_csv('commune_trails.csv', index=False)
+region_festivals.to_csv('region_festivals.csv', index=False)
+region_trails.to_csv('region_trails.csv', index=False)
+```
+
+#### `fete_cleaner.py`
+```{python, eval=FALSE, echo=TRUE}
+import pandas as pd
+
+def clean_festival_data(file_path):
+    df = pd.read_csv(file_path)
+    # Cleaning operations
+    df = df.dropna(subset=['Festival Name', 'Date', 'Location'])
+    df['Date'] = pd.to_datetime(df['Date'])
+    return df
+
+# Usage example:
+# cleaned_festivals = clean_festival_data('path_to_festival_data.csv')
+```
+
+#### `trails_cleaner.py`
+```{python, eval=FALSE, echo=TRUE}
+import pandas as pd
+
+def clean_trail_data(file_path):
+    df = pd.read_csv(file_path)
+    # Cleaning operations
+    df = df.dropna(subset=['Trail Name', 'Length', 'Location'])
+    df['Length'] = df['Length'].apply(lambda x: float(x.replace(' km', '')))
+    return df
+
+# Usage example:
+# cleaned_trails = clean_trail_data('path_to_trail_data.csv')
+```
+Each script provided above is responsible for specific data processing tasks, including data cleaning and extraction for visualization.
+
+1. The `viz_extractor.py` script combines data from festivals and trails to extract useful insights, such as the number of trails near festivals, and ranks of regions by the number of festivals and trails.
+2. The `fete_cleaner.py` script cleans the festival data by removing rows with missing essential information and converting date strings to datetime objects.
+3. The `trails_cleaner.py` script cleans the trail data by removing rows with missing essential information and converting trail lengths from strings to numeric values.

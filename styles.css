@@ -1,0 +1,31 @@
+/* styles.css */
+/* Custom font for specific phrase */
+.custom-phrase {
+  font-family: 'Courier New', Courier, monospace;
+  color: #D2691E; /* Chocolate */
+}
+
+/* Custom colors for header levels */
+h1 {
+  color: #8B4513; /* SaddleBrown */
+}
+
+h2 {
+  color: #A0522D; /* Sienna */
+}
+
+h3 {
+  color: #CD853F; /* Peru */
+}
+
+h4 {
+  color: #D2B48C; /* Tan */
+}
+
+h5 {
+  color: #DEB887; /* BurlyWood */
+}
+
+h6 {
+  color: #F5DEB3; /* Wheat */
+}

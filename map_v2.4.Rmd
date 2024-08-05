@@ -1,0 +1,231 @@
+---
+title: "Interactive Map of Festivals and Trails in France"
+author: "John Paul Celeste"
+date: "`r Sys.Date()`"
+output: html_document
+runtime: shiny
+---
+
+# Full Script
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Set CRAN repository mirror
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+# Function to check and install missing packages
+check_and_install <- function(packages) {
+  for (package in packages) {
+    if (!require(package, character.only = TRUE)) {
+      install.packages(package, dependencies = TRUE)
+      library(package, character.only = TRUE)
+    }
+  }
+}
+
+# List of required packages
+required_packages <- c("shiny", "leaflet", "dplyr", "geosphere", "purrr", "tidyr", "RColorBrewer")
+
+# Check and install missing packages
+check_and_install(required_packages)
+
+# Load necessary libraries
+required_libraries <- c("shiny", "leaflet", "dplyr", "geosphere", "purrr", "tidyr", "RColorBrewer")
+lapply(required_libraries, library, character.only = TRUE)
+
+# Read the dataset files
+festivals <- read.csv("cleaned_festivals.csv")
+trails <- read.csv("cleaned_trails.csv")
+```
+
+```{r data_processing, echo=TRUE, error=TRUE, message=TRUE}
+# Filter out rows without location data
+festivals <- festivals %>% filter(!is.na(Longitude) & !is.na(Latitude))
+trails <- trails %>% filter(!is.na(Longitude) & !is.na(Latitude))
+
+# Custom date conversion (Due to French names)
+convert_to_month <- function(date_str) {
+  months <- c("janvier" = 1, "février" = 2, "mars" = 3, "avril" = 4,
+              "mai" = 5, "juin" = 6, "juillet" = 7, "août" = 8,
+              "septembre" = 9, "octobre" = 10, "novembre" = 11, "décembre" = 12)
+  months[tolower(date_str)]
+}
+
+# Convert Debut and Fin columns to numeric months using custom function
+festivals$Debut <- sapply(festivals$Debut, convert_to_month)
+festivals$Fin <- sapply(festivals$Fin, convert_to_month)
+
+# Function to create popup information for festivals
+create_popup_info <- function(festival) {
+  website <- ifelse(grepl("\\.[a-z]{2,}$", festival$Site_internet_du_festival), 
+                    festival$Site_internet_du_festival, 
+                    paste0("https://www.google.com/search?q=", URLencode(festival$Nom_du_festival)))
+  
+  paste0("<strong>Festival: </strong>", festival$Nom_du_festival, "<br>",
+         "<strong>Period: </strong>", festival$Debut, " - ", festival$Fin, "<br>",
+         "<strong>Type: </strong>", festival$Discipline_dominante, "<br>",
+         "<strong>Commune: </strong>", festival$Commune_principale_de_deroulement, "<br>",
+         "<strong>Region: </strong>", festival$Region_principale_de_deroulement, "<br>",
+         "<strong>Year Established: </strong>", festival$Annee_de_creation_du_festival, "<br>",
+         "<strong>Website: </strong><a href='", website, "' target='_blank'>", website, "</a>")
+}
+
+# Function to create popup information for trails
+create_trail_popup_info <- function(trail) {
+  location <- paste0(trail$Latitude, ",", trail$Longitude)
+  google_maps_link <- paste0("https://www.google.com/maps/search/?api=1&query=", URLencode(location))
+  
+  paste0("<strong>Trail: </strong>", trail$Nom_du_POI, "<br>",
+         "<strong>Commune: </strong>", trail$commune, "<br>",
+         "<strong>Location: </strong>", trail$Latitude, ", ", trail$Longitude, "<br>",
+         "<strong>Address: </strong>", trail$Adresse_postale, "<br>",
+         "<strong>Description: </strong>", trail$Description, "<br>",
+         "<strong>Google Maps: </strong><a href='", google_maps_link, "' target='_blank'>", google_maps_link, "</a>")
+}
+
+# Calculate distances from trails to the nearest festival
+trail_distances <- trails %>%
+  rowwise() %>%
+  mutate(distance_to_festival = min(distHaversine(c(Longitude, Latitude), festivals %>% select(Longitude, Latitude))))
+
+trails <- trails %>%
+  mutate(distance_to_festival = trail_distances$distance_to_festival)
+```
+
+```{r map_ui, echo=TRUE, error=TRUE}
+# UI definition
+ui <- fluidPage(
+  tags$head(
+    tags$style(HTML("
+      #map {
+        height: calc(100vh - 80px) !important;
+      }
+    "))
+  ),
+  titlePanel("Interactive Map of Festivals and Trails in France"),
+  sidebarLayout(
+    sidebarPanel(
+      selectInput("region", "Select Region", choices = sort(unique(festivals$Region_principale_de_deroulement)), selected = "Grand Est"),
+      selectInput("commune", "Select Commune", choices = NULL),
+      uiOutput("festival_selector")
+    ),
+    mainPanel(
+      leafletOutput("map", width = "100%", height = "100%")
+    )
+  )
+)
+```
+
+
+```{r map_logic, echo=TRUE, error=TRUE}
+# Define server logic
+server <- function(input, output, session) {
+  output$map <- renderLeaflet({
+    # Create the base map
+    leaflet() %>%
+      addTiles() %>%
+      setView(lat = 46.603354, lng = 1.888334, zoom = 6)  # Centered on France
+  })
+  
+  # Observe changes in region selection and update communes accordingly
+  observe({
+    selected_region <- input$region
+    communes <- sort(unique(festivals$Commune_principale_de_deroulement[festivals$Region_principale_de_deroulement == selected_region]))
+    updateSelectInput(session, "commune", choices = communes, selected = communes[1])
+  })
+  
+  # Update the festival selector based on the selected commune
+  observe({
+    selected_region <- input$region
+    selected_commune <- input$commune
+    
+    filtered_festivals <- festivals %>%
+      filter(Region_principale_de_deroulement == selected_region,
+             Commune_principale_de_deroulement == selected_commune)
+    
+    updateSelectInput(session, "festival", "Select Festival", 
+                      choices = filtered_festivals$Nom_du_festival, selected = filtered_festivals$Nom_du_festival[1])
+  })
+  
+  output$festival_selector <- renderUI({
+    selectInput("festival", "Select Festival", choices = NULL)
+  })
+  
+  observeEvent(input$festival, {
+    selected_region <- input$region
+    selected_commune <- input$commune
+    selected_festival <- input$festival
+    
+    filtered_festivals <- festivals %>%
+      filter(Region_principale_de_deroulement == selected_region,
+             Commune_principale_de_deroulement == selected_commune,
+             Nom_du_festival == selected_festival)
+    
+    festival_coords <- filtered_festivals %>% select(Longitude, Latitude)
+    
+    if (nrow(festival_coords) > 0) {
+      filtered_trails <- trails %>%
+        rowwise() %>%
+        mutate(distance_to_festival = min(distHaversine(c(Longitude, Latitude), festival_coords))) %>%
+        filter(distance_to_festival <= 10000)
+    } else {
+      filtered_trails <- trails[FALSE,]
+    }
+
+    # Assign colors to festivals
+    num_festivals <- nrow(filtered_festivals)
+    if (num_festivals < 3) {
+      num_festivals <- 3  # Ensure at least 3 colors
+    }
+    festival_colors <- colorFactor(brewer.pal(num_festivals, "Set1"), filtered_festivals$Nom_du_festival)
+
+    # Create a color palette for trails based on distance
+    trail_color_pal <- colorNumeric(palette = "Dark2", domain = filtered_trails$distance_to_festival)
+    
+    # Center map on the selected festival if there are festivals or trails
+    if (nrow(filtered_festivals) > 0) {
+      center_lat <- mean(filtered_festivals$Latitude, na.rm = TRUE)
+      center_lng <- mean(filtered_festivals$Longitude, na.rm = TRUE)
+    } else if (nrow(filtered_trails) > 0) {
+      center_lat <- mean(filtered_trails$Latitude, na.rm = TRUE)
+      center_lng <- mean(filtered_trails$Longitude, na.rm = TRUE)
+    } else {
+      center_lat <- 46.603354
+      center_lng <- 1.888334
+    }
+    
+    leafletProxy("map") %>%
+      clearMarkers() %>%
+      setView(lat = center_lat, lng = center_lng, zoom = 10) %>%
+      addCircleMarkers(
+        data = filtered_festivals,
+        lat = ~Latitude,
+        lng = ~Longitude,
+        popup = ~sapply(1:nrow(filtered_festivals), function(i) {
+          popup_info <- create_popup_info(filtered_festivals[i,])
+          if (nrow(filtered_trails) == 0) {
+            popup_info <- paste0(popup_info, "<br><strong>Note: </strong>No trails found nearby.")
+          }
+          popup_info
+        }),
+        color = ~festival_colors(Nom_du_festival),
+        radius = 15
+      ) %>%
+      addCircleMarkers(
+        data = filtered_trails,
+        lat = ~Latitude,
+        lng = ~Longitude,
+        popup = ~sapply(1:nrow(filtered_trails), function(i) create_trail_popup_info(filtered_trails[i,])),
+        color = ~trail_color_pal(distance_to_festival),
+        fillOpacity = 0.8,  # Adjust opacity for better visibility
+        radius = 7
+      )
+  })
+} 
+```
+
+
+```{r launch_map, echo=FALSE, error=TRUE}
+# Run the application 
+shinyApp(ui = ui, server = server)
+```
